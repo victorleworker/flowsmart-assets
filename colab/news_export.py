@@ -22,7 +22,9 @@ Manifest:
   "burnSub": false,
   "subPos": {"x": 0.5, "y": 0.88} | null,     # normalized cue-block center (drag in app)
   "subStyle": {"size": 0.045, "color": "#ffffff"} | null,  # size = fraction of frame height
-  "music": {"path": "...", "volume": 0.15, "loop": true} | null,  # loop=fill whole bài
+  "music": {"path": "...", "paths": ["...",...]?, "volume": 0.15, "loop": true} | null,
+      # loop=fill whole bài; paths (18/7) = PLAYLIST theo thứ tự — nối thành 1 bed rồi loop/cắt
+      # theo bài (path đơn = back-compat, bị paths thắng khi có)
   "watermark": {"path": "/abs/wm.png", "x": 1, "y": 0,   # channel logo overlay (before subs)
                 "marginPct": 2.5, "scale": 0.12, "opacity": 0.7} | null,
                 # x/y = 0..1 inside the free space after the margin (corners = exactly 0/1);
@@ -258,6 +260,8 @@ def main():
     total = len(m["segments"])
     for i, seg in enumerate(m["segments"]):
         print(f"SEG {i + 1}/{total} {seg['id']}", flush=True)
+        # % lên thanh top app (main parse @@PROGRESS@@ → python:progress; +2 = CONCAT + MIX)
+        print("@@PROGRESS@@ " + json.dumps({"index": i, "total": total + 2, "step": seg["id"]}), flush=True)
         out_path = os.path.join(seg_dir, f"{seg['id']}.mp4")
         dl = None
         if rm is not None and seg["type"] == "clip":
@@ -269,6 +273,7 @@ def main():
 
     # ---- concat (uniform intermediates → demuxer is safe) ----
     print("CONCAT", flush=True)
+    print("@@PROGRESS@@ " + json.dumps({"index": total, "total": total + 2, "step": "concat"}), flush=True)
     list_path = os.path.join(seg_dir, "_concat.txt")
     with open(list_path, "w", encoding="utf-8") as f:
         for p in seg_files:
@@ -279,9 +284,34 @@ def main():
 
     # ---- final mix: raw + voiceover + music (+ subs: burn if libass exists, else soft mov_text) ----
     print("MIX", flush=True)
+    print("@@PROGRESS@@ " + json.dumps({"index": total + 1, "total": total + 2, "step": "mix"}), flush=True)
     final_path = os.path.join(out_dir, m.get("outName") or "FINAL.mp4")
     srt_path = m.get("srt") if (m.get("srt") and os.path.exists(m["srt"])) else None
     sub_result = "none"
+
+    # Playlist nhạc nền (18/7): music.paths >1 file → decode + nối thành 1 bed WAV trung gian
+    # (48k stereo pcm — mp3 sample-rate lệch nhau mà nối concat demuxer là vỡ tiếng), rồi nhánh
+    # single-file sẵn có (loop-to-fill / atrim cắt theo bài) dùng tiếp y nguyên. 1 file = đường cũ.
+    music_cfg = m.get("music") or None
+    if music_cfg:
+        _mp = [p for p in (music_cfg.get("paths") or []) if p and os.path.exists(p)]
+        if not _mp and music_cfg.get("path") and os.path.exists(music_cfg["path"]):
+            _mp = [music_cfg["path"]]
+        if len(_mp) > 1:
+            bed_path = os.path.join(out_dir, "_music_bed.wav")
+            ff = [FFMPEG, "-y"]
+            for p in _mp:
+                ff += ["-i", p]
+            fg = "".join(f"[{k}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[m{k}];" for k in range(len(_mp)))
+            fg += "".join(f"[m{k}]" for k in range(len(_mp))) + f"concat=n={len(_mp)}:v=0:a=1[mbed]"
+            run(ff + ["-filter_complex", fg, "-map", "[mbed]", "-c:a", "pcm_s16le", bed_path], "musicbed")
+            music_cfg = dict(music_cfg)
+            music_cfg["path"] = bed_path
+        elif _mp:
+            music_cfg = dict(music_cfg)
+            music_cfg["path"] = _mp[0]
+        else:
+            music_cfg = None
 
     def final_mix(burn):
         inputs = [FFMPEG, "-y", "-i", raw_path]
@@ -293,7 +323,7 @@ def main():
             filters.append(f"[{idx}:a]aresample=44100,aformat=channel_layouts=stereo,apad,atrim=0:{total_dur:.3f}[vo]")
             audio_labels.append("[vo]")
             idx += 1
-        music = m.get("music") or None
+        music = music_cfg  # đã resolve playlist→bed ở trên; None nếu không có/thiếu file
         if music and music.get("path") and os.path.exists(music["path"]):
             vol = float(music.get("volume", 0.15))
             loop_args = ["-stream_loop", "-1"] if music.get("loop", True) else []
